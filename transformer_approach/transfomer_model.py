@@ -6,10 +6,9 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 SOS_TOKEN = 0
 EOS_TOKEN = 1
+PAD_TOKEN = 2
 
 
 class Lang:
@@ -17,8 +16,8 @@ class Lang:
         self.name = name
         self.word2index = {}
         self.word2count = {}
-        self.index2word = {0: "SOS", 1: "EOS"}
-        self.n_words = 2  # Count SOS and EOS
+        self.index2word = {0: "SOS", 1: "EOS", 2: "PAD"}
+        self.n_words = 3  # Count SOS and EOS
 
     def add_sentence(self, sentence):
         for word in sentence.split(" "):
@@ -53,16 +52,16 @@ def normalize_string(s):
 def read_langs():
     print("Reading lines...")
 
-    with open("toy_datasets/kha_monolingual.txt", "r", encoding="utf-8") as fp:
+    with open("../toy_datasets/kha_monolingual.txt", "r", encoding="utf-8") as fp:
         kha_monolingual_lines = fp.readlines()
 
-    with open("toy_datasets/en_monolingual.txt", "r", encoding="utf-8") as fp:
+    with open("../toy_datasets/en_monolingual.txt", "r", encoding="utf-8") as fp:
         en_monolingual_lines = fp.readlines()
 
-    with open("toy_datasets/kha_parallel.txt", "r", encoding="utf-8") as fp:
+    with open("../toy_datasets/kha_parallel.txt", "r", encoding="utf-8") as fp:
         kha_parallel_lines = fp.readlines()
 
-    with open("toy_datasets/en_parallel.txt", "r", encoding="utf-8") as fp:
+    with open("../toy_datasets/en_parallel.txt", "r", encoding="utf-8") as fp:
         en_parallel_lines = fp.readlines()
 
     assert len(kha_parallel_lines) == len(en_parallel_lines)
@@ -113,19 +112,6 @@ def prepare_data():
     )
 
 
-(
-    kha_lang,
-    en_lang,
-    kha_monolingual_lines,
-    en_monolingual_lines,
-    kha_parallel_lines,
-    en_parallel_lines,
-) = prepare_data()
-
-# print(kha_lang.word2index)
-# exit(1)
-
-
 # Define the dataset class
 class ParallelDataset(Dataset):
     def __init__(self, src_lines, tgt_lines, src_lang, tgt_lang):
@@ -165,55 +151,42 @@ class MonolingualDataset(Dataset):
         return torch.tensor(indices)
 
 
-# Create datasets and dataloaders
-parallel_dataset = ParallelDataset(
-    kha_parallel_lines, en_parallel_lines, kha_lang, en_lang
-)
-kha_monolingual_dataset = MonolingualDataset(kha_monolingual_lines, kha_lang)
-en_monolingual_dataset = MonolingualDataset(en_monolingual_lines, en_lang)
-
-
 # Helper function to pad sequences
 def pad_sequences(batch):
     # Check if the batch contains pairs of sequences (parallel data)
     is_parallel = isinstance(batch[0], tuple)
 
     if is_parallel:
-        # Sort the sequences by length (descending)
+        # Sort the sequences by the length of the source sequence (descending)
         sorted_batch = sorted(batch, key=lambda x: len(x[0]), reverse=True)
 
         # Separate source and target sequences
         src_seqs = [x[0] for x in sorted_batch]
         tgt_seqs = [x[1] for x in sorted_batch]
 
-        # Pad the sequences
-        src_padded = pad_sequence(src_seqs, batch_first=True, padding_value=0)
-        tgt_padded = pad_sequence(tgt_seqs, batch_first=True, padding_value=0)
+        # Find the maximum length among both source and target sequences
+        max_length = max(max(len(s) for s in src_seqs), max(len(t) for t in tgt_seqs))
+
+        # Pad the sequences to the maximum length
+        src_padded = [
+            torch.cat([s, torch.tensor([PAD_TOKEN] * (max_length - len(s)))])
+            for s in src_seqs
+        ]
+        tgt_padded = [
+            torch.cat([t, torch.tensor([PAD_TOKEN] * (max_length - len(t)))])
+            for t in tgt_seqs
+        ]
+
+        # Convert to tensors
+        src_padded = torch.stack(src_padded)
+        tgt_padded = torch.stack(tgt_padded)
 
         return src_padded, tgt_padded
     else:
         # Monolingual data
         sorted_batch = sorted(batch, key=len, reverse=True)
-        padded = pad_sequence(sorted_batch, batch_first=True, padding_value=0)
+        padded = pad_sequence(sorted_batch, batch_first=True, padding_value=PAD_TOKEN)
         return padded
-
-
-BATCH_SIZE = 32
-parallel_dataloader = DataLoader(
-    parallel_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_sequences
-)
-kha_monolingual_dataloader = DataLoader(
-    kha_monolingual_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    collate_fn=pad_sequences,
-)
-en_monolingual_dataloader = DataLoader(
-    en_monolingual_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    collate_fn=pad_sequences,
-)
 
 
 class PositionalEncoding(nn.Module):
@@ -229,8 +202,6 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pos_embedding", pos_embedding)
 
     def forward(self, token_embedding: torch.Tensor):
-        print(token_embedding.shape)
-        print(self.pos_embedding)
         return self.dropout(
             token_embedding + self.pos_embedding[: token_embedding.size(0), :]
         )
@@ -271,7 +242,7 @@ class Seq2SeqTransformer(nn.Module):
         self.src_tok_emb = TokenEmbedding(src_vocab_size, hidden_size)
         self.tgt_tok_emb = TokenEmbedding(tgt_vocab_size, hidden_size)
         self.positional_encoding = PositionalEncoding(hidden_size, dropout=dropout).to(
-            device
+            DEVICE
         )
 
     def forward(
@@ -286,6 +257,7 @@ class Seq2SeqTransformer(nn.Module):
     ):
         src_emb = self.positional_encoding(self.src_tok_emb(src))
         tgt_emb = self.positional_encoding(self.tgt_tok_emb(trg))
+
         outs = self.transformer(
             src_emb,
             tgt_emb,
@@ -316,12 +288,49 @@ def create_mask(src, tgt):
     tgt_mask = generate_square_subsequent_mask(tgt_seq_len)
     src_mask = torch.zeros((src_seq_len, src_seq_len), device=DEVICE).type(torch.bool)
 
-    src_padding_mask = (src == PAD_IDX).transpose(0, 1)
-    tgt_padding_mask = (tgt == PAD_IDX).transpose(0, 1)
+    src_padding_mask = (src == 0).transpose(0, 1)
+    tgt_padding_mask = (tgt == 0).transpose(0, 1)
     return src_mask, tgt_mask, src_padding_mask, tgt_padding_mask
 
 
-if __name__ == "main":
+if __name__ == "__main__":
+
+    # DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    DEVICE = "cpu"
+
+    (
+        kha_lang,
+        en_lang,
+        kha_monolingual_lines,
+        en_monolingual_lines,
+        kha_parallel_lines,
+        en_parallel_lines,
+    ) = prepare_data()
+
+    BATCH_SIZE = 32
+
+    # Create datasets and dataloaders
+    parallel_dataset = ParallelDataset(
+        kha_parallel_lines, en_parallel_lines, kha_lang, en_lang
+    )
+    kha_monolingual_dataset = MonolingualDataset(kha_monolingual_lines, kha_lang)
+    en_monolingual_dataset = MonolingualDataset(en_monolingual_lines, en_lang)
+
+    parallel_dataloader = DataLoader(
+        parallel_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_sequences
+    )
+    kha_monolingual_dataloader = DataLoader(
+        kha_monolingual_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=pad_sequences,
+    )
+    en_monolingual_dataloader = DataLoader(
+        en_monolingual_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=pad_sequences,
+    )
 
     HIDDEN_SIZE = 256
 
@@ -373,78 +382,19 @@ if __name__ == "main":
         # Calculate loss for D_K (Khasi Monolingual)
         loss_K = 0
         for x_i in kha_monolingual_dataloader:
-            x_i = x_i.to(DEVICE)  # Move input tensor to GPU
+            src = x_i.to(DEVICE)  # Move input tensor to GPU
 
-            # Create necessary masks and padding masks (example using kha_to_en_model)
-            src_mask = kha_to_en_model.transformer.generate_square_subsequent_mask(
-                len(x_i)
-            ).to(DEVICE)
-            tgt_mask = kha_to_en_model.transformer.generate_square_subsequent_mask(
-                len(x_i)
-            ).to(DEVICE)
-            src_padding_mask = (x_i == 0).transpose(0, 1).to(DEVICE)
-            tgt_padding_mask = (x_i == 0).transpose(0, 1).to(DEVICE)
+            tgt_input = torch.zeros_like(src).to(DEVICE)
+
+            # Create necessary masks and padding masks (example using en_to_kha_model)
+            src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(
+                src, tgt_input
+            )
             memory_key_padding_mask = src_padding_mask
 
             # Call kha_to_en_model to get the translated sequence
-            translated_sequence = kha_to_en_model(
-                x_i,
-                x_i,
-                src_mask,
-                tgt_mask,
-                src_padding_mask,
-                tgt_padding_mask,
-                memory_key_padding_mask,
-            )
-
-            # Create masks and padding masks for en_to_kha_model
-            src_mask_en_to_kha = (
-                en_to_kha_model.transformer.generate_square_subsequent_mask(
-                    len(translated_sequence)
-                ).to(DEVICE)
-            )
-            tgt_mask_en_to_kha = (
-                en_to_kha_model.transformer.generate_square_subsequent_mask(
-                    len(translated_sequence)
-                ).to(DEVICE)
-            )
-            src_padding_mask_en_to_kha = (
-                (translated_sequence == 0).transpose(0, 1).to(DEVICE)
-            )
-            tgt_padding_mask_en_to_kha = (
-                (translated_sequence == 0).transpose(0, 1).to(DEVICE)
-            )
-            memory_key_padding_mask_en_to_kha = src_padding_mask_en_to_kha
-
-            # Call en_to_kha_model with the translated sequence and appropriate masks
-            x_i_hat = en_to_kha_model(
-                translated_sequence,
-                translated_sequence,
-                src_mask_en_to_kha,
-                tgt_mask_en_to_kha,
-                src_padding_mask_en_to_kha,
-                tgt_padding_mask_en_to_kha,
-                memory_key_padding_mask_en_to_kha,
-            )
-
-            loss_K += torch.norm(x_i - x_i_hat) ** 2
-        loss_K = LAMBDA_K * loss_K / len(kha_monolingual_dataset)
-
-        # Calculate loss for D_E (English Monolingual)
-        loss_E = 0
-        for x_i in en_monolingual_dataloader:
-            x_i = x_i.to(DEVICE)  # Move input tensor to GPU
-
-            tgt_input = x_i[:-1, :]
-
-
-            # Create necessary masks and padding masks (example using en_to_kha_model)
-            src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(src, tgt_input)
-            memory_key_padding_mask = src_padding_mask
-
-            # Call en_to_kha_model to get the translated sequence
-            translated_sequence = en_to_kha_model(
-                x_i,
+            translated_sequence_logits = kha_to_en_model(
+                src,
                 tgt_input,
                 src_mask,
                 tgt_mask,
@@ -453,29 +403,83 @@ if __name__ == "main":
                 memory_key_padding_mask,
             )
 
+            # Convert logits to token indices
+            translated_sequence_indices = translated_sequence_logits.argmax(dim=-1)
+
             # Create masks and padding masks for en_to_kha_model
-            src_mask_kha_to_en = (
-                kha_to_en_model.transformer.generate_square_subsequent_mask(
-                    len(translated_sequence)
-                ).to(DEVICE)
+            (
+                src_mask_en_to_kha,
+                tgt_mask_en_to_kha,
+                src_padding_mask_en_to_kha,
+                tgt_padding_mask_en_to_kha,
+            ) = create_mask(translated_sequence_indices, src)
+            memory_key_padding_mask_en_to_kha = src_padding_mask_en_to_kha
+
+            src_input = torch.zeros_like(translated_sequence_indices).to(DEVICE)
+
+            # Call en_to_kha_model with the translated sequence and appropriate masks
+            x_i_hat_logits = en_to_kha_model(
+                translated_sequence_indices,
+                src,
+                src_mask_en_to_kha,
+                tgt_mask_en_to_kha,
+                src_padding_mask_en_to_kha,
+                tgt_padding_mask_en_to_kha,
+                memory_key_padding_mask_en_to_kha,
             )
-            tgt_mask_kha_to_en = (
-                kha_to_en_model.transformer.generate_square_subsequent_mask(
-                    len(translated_sequence)
-                ).to(DEVICE)
+
+            x_i_hat = x_i_hat_logits.argmax(dim=-1)
+
+            loss_K += torch.norm(x_i.float() - x_i_hat.float()) ** 2
+
+            # loss_K += nn.CrossEntropyLoss()(
+            #     x_i_hat_logits.view(-1, kha_vocab_size), src.view(-1).long()
+            # )
+
+        loss_K = LAMBDA_K * loss_K / len(kha_monolingual_dataset)
+
+        # Calculate loss for D_E (English Monolingual)
+        loss_E = 0
+        for x_i in en_monolingual_dataloader:
+            src = x_i.to(DEVICE)  # Move input tensor to GPU
+
+            tgt_input = torch.zeros_like(src).to(DEVICE)
+
+            # Create necessary masks and padding masks (example using en_to_kha_model)
+            src_mask, tgt_mask, src_padding_mask, tgt_padding_mask = create_mask(
+                src, tgt_input
             )
-            src_padding_mask_kha_to_en = (
-                (translated_sequence == 0).transpose(0, 1).to(DEVICE)
+            memory_key_padding_mask = src_padding_mask
+
+            # Call en_to_kha_model to get the translated sequence
+            translated_sequence_logits = en_to_kha_model(
+                src,
+                tgt_input,
+                src_mask,
+                tgt_mask,
+                src_padding_mask,
+                tgt_padding_mask,
+                memory_key_padding_mask,
             )
-            tgt_padding_mask_kha_to_en = (
-                (translated_sequence == 0).transpose(0, 1).to(DEVICE)
-            )
+
+            # Convert logits to token indices
+            translated_sequence_indices = translated_sequence_logits.argmax(dim=-1)
+
+            # Create masks and padding masks for en_to_kha_model
+            (
+                src_mask_kha_to_en,
+                tgt_mask_kha_to_en,
+                src_padding_mask_kha_to_en,
+                tgt_padding_mask_kha_to_en,
+            ) = create_mask(translated_sequence_indices, src)
             memory_key_padding_mask_kha_to_en = src_padding_mask_kha_to_en
 
+            src_input = torch.zeros_like(translated_sequence_indices).to(DEVICE)
+
             # Call kha_to_en_model with the translated sequence and appropriate masks
-            x_i_hat = kha_to_en_model(
-                translated_sequence,
-                translated_sequence,
+            x_i_hat_logits = kha_to_en_model(
+                translated_sequence_indices,
+                src_input,
                 src_mask_kha_to_en,
                 tgt_mask_kha_to_en,
                 src_padding_mask_kha_to_en,
@@ -483,21 +487,94 @@ if __name__ == "main":
                 memory_key_padding_mask_kha_to_en,
             )
 
-            loss_E += torch.norm(x_i - x_i_hat) ** 2
+            x_i_hat = x_i_hat_logits.argmax(dim=-1)
+
+            loss_E += torch.norm(x_i.float() - x_i_hat.float()) ** 2
+
+            # loss_E += nn.CrossEntropyLoss()(
+            #     x_i_hat_logits.view(-1, en_vocab_size), src.view(-1).long()
+            # )
+
         loss_E = LAMBDA_K * loss_E / len(kha_monolingual_dataset)
 
         # Calculate loss for D_P (Parallel Data)
         loss_P_K = 0
         loss_P_E = 0
         for u_k, v_k in parallel_dataloader:
+
+            tgt_input_u_k = torch.zeros_like(v_k).to(DEVICE)
+            tgt_input_v_k = torch.zeros_like(u_k).to(DEVICE)
+
+            (
+                src_mask_kha_to_en,
+                tgt_mask_kha_to_en,
+                src_padding_mask_kha_to_en,
+                tgt_padding_mask_kha_to_en,
+            ) = create_mask(u_k, tgt_input_u_k)
+            (
+                src_mask_en_to_kha,
+                tgt_mask_en_to_kha,
+                src_padding_mask_en_to_kha,
+                tgt_padding_mask_en_to_kha,
+            ) = create_mask(v_k, tgt_input_v_k)
+
             u_k = u_k.to(DEVICE)  # Move data to the appropriate device
             v_k = v_k.to(DEVICE)  # Move data to the appropriate device
-            v_k_hat = kha_to_en_model(u_k)
-            u_k_hat = en_to_kha_model(v_k)
-            loss_P_K += torch.norm(v_k - v_k_hat) ** 2
-            loss_P_E += torch.norm(u_k - u_k_hat) ** 2
+
+            # v_k_hat = kha_to_en_model(
+            #     u_k,
+            #     tgt_input_u_k,
+            #     src_mask_kha_to_en,
+            #     tgt_mask_kha_to_en,
+            #     src_padding_mask_kha_to_en,
+            #     tgt_padding_mask_kha_to_en,
+            #     src_padding_mask_kha_to_en,
+            # ).argmax(dim=-1)
+            # u_k_hat = en_to_kha_model(
+            #     v_k,
+            #     tgt_input_v_k,
+            #     src_mask_en_to_kha,
+            #     tgt_mask_en_to_kha,
+            #     src_padding_mask_en_to_kha,
+            #     tgt_padding_mask_en_to_kha,
+            #     src_padding_mask_en_to_kha,
+            # ).argmax(dim=-1)
+
+            # loss_P_K += torch.norm(v_k.float() - v_k_hat.float()) ** 2
+            # loss_P_E += torch.norm(u_k.float() - u_k_hat.float()) ** 2
+
+            # Get the logits directly
+            v_k_hat_logits = kha_to_en_model(
+                u_k,
+                tgt_input_u_k,
+                src_mask_kha_to_en,
+                tgt_mask_kha_to_en,
+                src_padding_mask_kha_to_en,
+                tgt_padding_mask_kha_to_en,
+                src_padding_mask_kha_to_en,
+            )
+            u_k_hat_logits = en_to_kha_model(
+                v_k,
+                tgt_input_v_k,
+                src_mask_en_to_kha,
+                tgt_mask_en_to_kha,
+                src_padding_mask_en_to_kha,
+                tgt_padding_mask_en_to_kha,
+                src_padding_mask_en_to_kha,
+            )
+
+            # Calculate loss using logits and the appropriate loss function (e.g., cross-entropy)
+            loss_P_K += nn.CrossEntropyLoss()(
+                v_k_hat_logits.view(-1, en_vocab_size), v_k.view(-1).long()
+            )
+            loss_P_E += nn.CrossEntropyLoss()(
+                u_k_hat_logits.view(-1, kha_vocab_size), u_k.view(-1).long()
+            )
+
+
         loss_P_K = LAMBDA_P_K * loss_P_K / len(parallel_dataset)
         loss_P_E = LAMBDA_P_E * loss_P_E / len(parallel_dataset)
+
 
         # Total loss
         loss = loss_K + loss_E + loss_P_K + loss_P_E
@@ -506,8 +583,7 @@ if __name__ == "main":
         loss.backward()
         optimizer.step()
 
-        # Print loss for monitoring
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}")
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {loss:.4f}")
 
     # Save the trained models
     torch.save(kha_to_en_model.state_dict(), "kha_to_en_model.pth")
